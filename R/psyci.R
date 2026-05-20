@@ -21,14 +21,32 @@
 #'
 #' @param model an anova model made using the afex package (class afex_aov)
 #' @param contrast_tables a LIST of contrast tables generated using emmeans contrast()
+#' Note that this list should contain only orthogonal contrast tables, or non-orthogonal.
+#' Do not mix or match orthogonal or non-orthogonal. If there is only one table of contrasts,
+#' it is not necesssary to enter it as a list.
 #' @param method a single string - method for confidence interval computation -
-#' "ind", "bf", or "ph" - see further details below
+#' "ind", "bf", "ph", or "smr" - see further details below
 #' @param family_list - a LIST the same length of contrast tables that specifies
 #' if the associated contrast table is of the family "b", "w", or "bw"
 #' @param between_factors - a list of between subject factor names, default = NA
 #' @param within_factors - a list of within subject factor names, default = NA
-#' @param alpha - desired type 1 error rate
-#'
+#' @param alpha - desired type 1 error rate. Either a single value (e.g. alpha = .05)
+#' that will be applied to each family, or a list of alphas of length
+#' contrast_tables. Assumes that the alphas are provided in the order as should be
+#' applied to contrast_tables. default = .05.
+#' @param independent - a boolean value, default = TRUE. If TRUE, correction will
+#' be applied to each family independently. If FALSE, all contrasts will be summed
+#' together and treated as one family for the purposes of correction.
+#' This is only relevant if method = "bf" or method = "ph", and will be ignored if method = "ind".
+#' @param nu1 - if independent is set to FALSE, and method = "ph", then supply nu1 (df1) that
+#' is used to adjust the critical constant to control for type 1 error (see eqs 7, 8, 9 of
+#' Bird (2002) https://doi.org/10.1177/0013164402062002001). default = NA
+#' @param smr_params - a list of parameters required for the smr method.
+#' This should contain the following fields: p, q, n_sim (optional, default = 100000),
+#' and seed (optional, default = NULL). See Bird & Hazli-Pavlovic (2005)
+#' https://doi.org/10.1111/j.1467-9280.2005.01587.x Table 2, for the definition of p and q,
+#' and the documentation for the smr method (?smr_crit) for further details on n_sim and seed.
+#' default = NULL
 #' @return an emmeans contrast table with confidence intervals added
 #' @export
 #'
@@ -46,20 +64,35 @@
 #' # now add CI's using post-hoc method
 #' psyci(model = mod, contrast_tables = list(btwn_con), method = "ph",
 #'         family_list = list("b"), between_factors = list("group"))
-psyci <- function(model, contrast_tables, method, family_list,
-                  between_factors = NA, within_factors = NA, alpha = 0.05){
+psyci <- function(model, contrast_tables, method,
+                  family_list,
+                  between_factors = NA,
+                  within_factors = NA,
+                  alpha = 0.05,
+                  independent = TRUE,
+                  nu1 = NA,
+                  smr_params = NULL,
+                  seed = NULL){
 
   if(!inherits(model, "afex_aov")){
     stop("Error: model needs to be of class afex_aov")
   }
-  if (!method %in% c("ind", "bf", "ph")){
-    stop("Error: method should be ind, bf, or ph")
+  if (!method %in% c("ind", "bf", "ph", "smr")){
+    stop("Error: method should be ind, bf, ph, or smr")
   }
 
   if (!is.list(family_list)){
     stop("Error: family_list should be a list of family codes") # may update this later
   }
 
+  # first check if a single contrast table has been entered, and if so, convert
+  # to be a list
+  types <- c("emmGrid", "summary_emm")
+  if (sum(sapply(types, inherits, x=contrast_tables))){
+    # if this is passed, then someone has entered a single object rather than a
+    # list
+    contrast_tables <- list(contrast_tables) # convert to list
+  }
   test_emmGrids <- sum(sapply(contrast_tables, inherits, "emmGrid"))
   test_summary_emm <- sum(sapply(contrast_tables, inherits, "summary_emm"))
   if (test_emmGrids == length(contrast_tables) |
@@ -68,90 +101,170 @@ psyci <- function(model, contrast_tables, method, family_list,
     stop("Error: contrast table needs to be of class emmGrid or summary_emm")
   }
 
+  if (!independent){
+    if (method %in% "ph"){
+      if (is.na(nu1)) {
+        stop("Error: post-hoc method with non-orthogonal families requested but nu1 remains undefined. Please supply via `nu1=` argument")
+      }
+    }
+  }
+
+  if (method %in% "smr"){
+
+    # double check families to make sure no within sub factors
+    fam_check <- unlist(
+      lapply(family_list, function(x) x %in% c("w", "bw")))
+
+    if (any(unlist(fam_check))){
+      stop("Error: You have requested the SMR procedure, but the family_list contains within subject related families.
+           Please check your family_list and method arguments.")
+    }
+
+    # now check that smr_params has been entered correctly
+    # first pass
+    if (any(is.na(smr_params))){
+      stop("Error: You have requested the SMR procedure,
+           but have not supplied the required smr_params argument.
+           Please check your method and smr_params arguments.")
+    }
+    # checking for fields, and the length of those fields
+    required_fields = c("p", "q")
+     if (!all(required_fields %in% names(smr_params))){
+       stop("Error: You have requested the SMR procedure, but your smr_params argument is missing one or more required fields.
+            Please check your method and smr_params arguments.")
+     }
+  }
+  # if method is smr, check whether or not the n_sim or seed params
+  # have been passed in. If not, set to the defaults
+  if (method %in% "smr"){
+    if (!"n_sim" %in% names(smr_params)){
+      smr_params$n_sim = 100000
+    }
+  }
+  # if the method is not smr, then set an smr_params value to null,
+  # for later use in the update_attributes function
+  if (!method %in% "smr"){
+   smr_params = NULL
+  }
+
+  # now put the contrast table info together
   contrast_info <- do.call(rbind, contrast_tables)
   all_contrast_tables <- summary(contrast_info) # create one big contrast table that one can index easily
   contrast_tables <- contrast_tables # keeping list
   # get the error df
   v_e = unique(all_contrast_tables$df)
+
   if (length(v_e) > 1){
     stop("Error: more than one contrast analysis passed in")
   }
 
-  # here I am assuming I get a list, called 'family_list' for now
-  # which designates which table from the list of contrast_tables contains
-  # which type of contrasts
-
-  # before proceeding, I am going to check all contrast vectors sums == 0,
-  # if I find any that exceed 0, throw an error
-  # KG. To cross reference this with Psy/work out why it was commented out
-  # junk = junk_check(contrast_tables)
-  # junk_test <- sapply(junk, function(x) length(x) == 0)
-  # if (!all(junk_test)){
-  #   stop(sprintf("Error: list element %d has contrasts that sum to > zero. Please remove and try again",
-  #                which(!junk_test)))
-  # }
-
   # if required, get v_b and v_w
-  v_b = NA # setting these as NA, in case
-  v_w = NA
+  v_b = 1 # setting these as 1, in case, if not they will be updated in the if statement below
+  v_w = 1
+
   if (method %in% "ph"){
     if (any(family_list == "b") | any(family_list == "bw")){
 
-      v_b = compute_df(model, fctrs = between_factors)
+      if (independent){
+        v_b = compute_df(model, fctrs = between_factors)
+      } else {
+        # here I need to get the factors, and the correct families
+        v_b = nu1
+      }
     }
     if (any(family_list == "w")  | any(family_list == "bw")){
 
-      v_w = compute_df(model, fctrs = within_factors)
+      if (independent){
+        v_w = compute_df(model, fctrs = within_factors)
+      } else {
+        v_w = nu1
+      }
     }
   }
 
   # now get the appropriate critical constant, given requested
   # method
-  # first, make a list of critical constants, that is as long
+  # first, make a list for critical constants, that is as long
   # as the number of contrast tables that have been passed in as
   # contrast tables
-  critical_constant = list()
-  length(critical_constant) = length(family_list)
-  names(critical_constant) = family_list
+  nfamilies = length(contrast_tables)
+  if (length(family_list) == 1 & nfamilies > 1){
+    family_list = rep(family_list, times=nfamilies)
+  } else if (length(family_list) == nfamilies) {
+    family_list = family_list
+  } else {
+    stop("Error: length of family_list is incompatible with length of contrast_tables")
+  }
+
+  # now make sure provided alphas are compatible with the number of families
+  if (length(alpha) == 1){
+    alphas = rep(list(alpha), length(contrast_tables))
+  } else {
+    alphas = alpha
+  }
+  if (length(alphas) != length(contrast_tables)){
+    stop(sprintf("Error! Provided alpha is of length > 1 and does not match
+                   length of contrast tables"))
+  }
+  names(alphas) = family_list
 
   if (method %in% "ind"){
 
-    critical_constant[1:length(critical_constant)] = rep(cc_ind_t(v_e=v_e, alpha=alpha),
-                                                         length(critical_constant))
+    critical_constant = lapply(alphas, cc_ind_t, v_e=v_e)
 
   } else if (method %in% "bf") {
 
-    cs <- lapply(contrast_tables, stats::coef)
-    nk = sum(unlist(lapply(cs, function(x) ncol(x[,grep("c.*", names(x))]))))
-    critical_constant[1:length(critical_constant)] = rep(cc_bonf_t(v_e=v_e, n_k=nk, alpha=alpha),
-                                                         length(critical_constant))
+    # first, get the nk per family
+    cs = get_contrast_coefficients(contrast_tables)
+    nk = unlist(lapply(cs, function(x) ncol(x[,grep("c.*", names(x))])))
+   if (!independent){ # if not independent families
+     nk = rep(sum(nk), length(nk))
+   }
+
+   critical_constant = mapply(cc_bonf_t, n_k=nk, alpha=alphas, MoreArgs=list(v_e=v_e), SIMPLIFY=FALSE)
 
   } else if (method %in% "ph"){
 
     # here we make a list of critical constants, to be applied to construct confidence
     # intervals for each family of interest
-
+    critical_constant = vector("list", length(contrast_tables)) # need to make a list for the critical constants
+    # that we will collect, and we name them after the families
+    names(critical_constant) = family_list
 
     if (any(family_list == "b")){
 
-      cc_b = cc_ph_b(v_b=v_b, v_e=v_e, alpha=alpha)
-      critical_constant[["b"]] = cc_b
-
+      cc_bs = lapply(alphas[names(alphas) %in% "b"], cc_ph_b, v_b=v_b, v_e=v_e)
+      critical_constant[names(critical_constant) %in% "b"] = cc_bs
     }
 
     if (any(family_list == "w")) {
 
-      cc_w = cc_ph_w(v_w=v_w, v_e=v_e, alpha=alpha)
-      critical_constant[["w"]] = cc_w
-
+      cc_w = lapply(alphas[names(alphas) %in% "w"], cc_ph_w, v_w=v_w, v_e=v_e)
+      #cc_ph_w(v_w=v_w, v_e=v_e, alpha=alpha)
+      critical_constant[names(critical_constant) %in% "w"] = cc_w
     }
 
     if (any(family_list == "bw")) {
 
-      cc_bw = cc_ph_bw(v_w=v_w, v_b=v_b, v_e=v_e, alpha=alpha)
-      critical_constant[["bw"]] = cc_bw
-
+      cc_bw = lapply(alphas[names(alphas) %in% "bw"], cc_ph_bw, v_w=v_w, v_b=v_b, v_e=v_e)
+      critical_constant[names(critical_constant) %in% "bw"] = cc_bw
     }
+  } else if (method %in% "smr"){
+
+    # do we have a seed setting?
+    if ("seed" %in% names(smr_params)){
+      seed = smr_params$seed
+    } else {
+      seed = NULL
+    }
+    # get the critical constant
+    smr_alpha <- unlist(unique(alphas))
+    if (length(smr_alpha) > 1){
+      stop("Error: more than one alpha value provided for SMR method")
+    }
+    cc_smr = sqrt(smr_crit(alpha = smr_alpha, p = smr_params$p, q = smr_params$q,
+                            n = v_e, n_sim = smr_params$n_sim, seed = seed))
+    critical_constant = rep(cc_smr, length(contrast_tables))
   }
 
   # now get SE from each contrast table in contrast_tables, compute CIs using appropriate
@@ -165,17 +278,27 @@ psyci <- function(model, contrast_tables, method, family_list,
   families = family_list
   btwn_fctrs = wthn_fctrs = v_ws = v_bs = as.list(rep(NA, n_c_tables))
   names(btwn_fctrs) = names(wthn_fctrs) = names(v_ws) = names(v_bs) = families
-  btwn_fctrs[names(btwn_fctrs) %in% c("b", "bw")] = between_factors
-  wthn_fctrs[names(wthn_fctrs) %in% c("w", "bw")] = within_factors
+  btwn_fctrs_idx = names(btwn_fctrs) %in% c("b", "bw")
+  btwn_fctrs[btwn_fctrs_idx] = lapply(btwn_fctrs[btwn_fctrs_idx], function(x){
+    unlist(between_factors)
+  })
+  wthn_fctrs_idx = names(wthn_fctrs) %in% c("w", "bw")
+   wthn_fctrs[wthn_fctrs_idx] = lapply(wthn_fctrs[wthn_fctrs_idx], function(x){
+     unlist(within_factors)
+   })
+
   v_bs[names(v_bs) %in% c("b", "bw")] = v_b
   v_ws[names(v_ws) %in% c("w", "bw")] = v_w
   v_es = as.list(rep(v_e, n_c_tables))
-  alphas = as.list(rep(alpha, n_c_tables))
+  alphas = alphas
 
   contrasts_w_cis <- mapply(update_attributes, contrasts_w_cis, method = methods,
                             family=families, between_factors=btwn_fctrs,
                             within_factors=wthn_fctrs, v_b=v_bs, v_w=v_ws,
-                            v_e=v_es, alpha=alphas, SIMPLIFY = FALSE)
+                            v_e=v_es, alpha=alphas,
+                            MoreArgs=list(smr_params=smr_params),
+                            SIMPLIFY = FALSE)
+
   names(contrasts_w_cis) = families
 
   return(contrasts_w_cis)
