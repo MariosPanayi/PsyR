@@ -9,9 +9,7 @@ knitr::opts_chunk$set(
   collapse = TRUE,
   comment = "#>",
   fig.path = "man/figures/README-",
-  out.width = "100%",
-  message = FALSE,
-  warning = FALSE
+  out.width = "100%"
 )
 ```
 
@@ -26,7 +24,7 @@ The goal of PsyR is to ...
 
 You can install the development version of PsyR from [GitHub](https://github.com/) with:
 
-``` {r, eval = FALSE}
+``` {r}
 # install.packages("devtools")
 devtools::install_github("garner-code/PsyR")
 ```
